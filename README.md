@@ -1,3 +1,163 @@
+# Seawater CFD Studies — Ansys Fluent UDFs
+
+---
+
+## Study 2 — 2D DPM: Cl⁻ Ion Migration Under Electric Field
+
+### Problem description
+
+A 2D rectangular channel (L = 1000 mm, H = 200 mm) carries seawater in the +x
+direction.  An electrode strip is fixed on the **top wall** at x = 200 mm
+(anode, +V).  The bottom wall acts as the counter-electrode (cathode, 0 V).
+Cl⁻ ions are injected as DPM particles at the inlet; they drift upward under
+the Coulomb force and are captured by the electrode when they arrive within
+its x-span.
+
+---
+
+### File: `dpm_cl_migration.c`
+
+#### Macro inventory
+
+| Macro | Purpose | Hook location |
+|---|---|---|
+| `cl_em_force` | EM body force on each Cl⁻ parcel (x, y components) | DPM Injection → Body Force UDF |
+| `cl_wall_bc` | Capture at electrode, reflect elsewhere on top wall | Boundary → top-wall → DPM → UDF |
+| `store_em_field` | Writes E-field & acceleration to UDM 0–3 each iteration | Function Hooks → Adjust |
+
+#### Electric field model
+
+```
+Background (uniform, y):   E_y = −V_APPLIED / H         [V/m]  (downward)
+Focusing (Gaussian, x):    E_x = E_FOCUS × (x−x_e) × exp[−(x−x_e)²/(2σ_x²)]
+
+Force on Cl⁻ (q = −e):
+  F_y = q × E_y = (−e)(−E0) = +eE0     → upward toward anode ✓
+  F_x: sign flips at x = x_e           → axial focusing toward electrode ✓
+```
+
+---
+
+### Suggested simulation parameters
+
+#### Continuous phase (seawater)
+
+| Property | Value | Notes |
+|---|---|---|
+| Density ρ | 1025 kg/m³ | 35 g/L salinity |
+| Dynamic viscosity μ | 1.08 × 10⁻³ Pa·s | 20 °C |
+| Inlet velocity U | **0.001 m/s** | Re = ρUH/μ ≈ 190 (laminar) |
+| Mass flow rate ṁ | **0.205 kg/(m·s)** | per unit depth = ρ·U·H |
+| Turbulence model | Laminar | Re ≪ 2300 |
+
+#### Discrete phase (Cl⁻ ion)
+
+| Property | Value | Derivation |
+|---|---|---|
+| Diameter d | 3.62 × 10⁻¹⁰ m | 2 × ionic radius (1.81 Å) |
+| Density ρ_p | 2375 kg/m³ | m\_ion / (π/6·d³) |
+| Charge q | −1.602 × 10⁻¹⁹ C | monovalent anion |
+| Mass m | 5.887 × 10⁻²⁶ kg | 35.45 u |
+| Specific charge q/m | −2.72 × 10⁶ C/kg | encoded in `QM` |
+| Initial v_x | = U = 0.001 m/s | match fluid at inlet |
+| Initial v_y | 0.0 m/s | let DPM integrate from rest |
+| Drag law | Stokes-Cunningham | Kn ≫ 1 for sub-nm particle |
+| Max tracking steps | 50 000 | ions drift slowly |
+
+> **Injection note**: Fluent requires a finite flow rate for DPM injections.
+> Set it to a small representative value (e.g. 1 × 10⁻¹⁵ kg/s per stream line).
+> The Lorentz force is independent of this value; it only affects parcel weighting.
+
+#### Electromagnetic field
+
+| Parameter | Value | Effect |
+|---|---|---|
+| Applied voltage V_APPLIED | **1000 V** | between top (+) and bottom (−) walls |
+| Uniform field E0 | **5000 V/m** | = V / H |
+| Focusing amplitude E_FOCUS | **500 V/m** | x-component toward electrode |
+| Focusing width σ_x | 40 mm | |
+
+#### Predicted physics
+
+| Quantity | Formula | Result |
+|---|---|---|
+| Terminal v_ep (y) | \|q\|E / (3πμd) | **2.18 × 10⁻⁴ m/s** |
+| Time to cross H | H / v_ep | ≈ 917 s |
+| x-travel during crossing | U × t | ≈ 0.92 m |
+| Captured y-band (at inlet) | from capture condition | **y₀ ∈ [0.124, 0.168] m** |
+| Estimated capture efficiency | 44 mm / 200 mm | **≈ 22 %** (uniform injection) |
+
+---
+
+### Step-by-step Fluent V19 setup
+
+#### 1. Compile the UDF
+**Define → User-Defined → Functions → Compiled…**
+Add `dpm_cl_migration.c`, click **Build** then **Load**.
+
+#### 2. Allocate UDM slots
+**Define → User-Defined → Memory…** → set to **4**
+
+Slot | Quantity
+-----|----------
+0 | E_x (V/m)
+1 | E_y (V/m)
+2 | a_x = F_x/m (m/s²)
+3 | a_y = F_y/m (m/s²)
+
+#### 3. Hook DEFINE_ADJUST
+**Define → User-Defined → Function Hooks → Adjust** → add `store_em_field`
+
+#### 4. Enable DPM
+**Models → Discrete Phase Model → ON**
+- Interaction: *Steady particle tracking* (or unsteady for time-accurate)
+- Max number of steps: 50 000
+- Step length factor: 5
+
+#### 5. Create injection at inlet
+**Define → Injections → Create**
+- Type: **Surface** (select the inlet face)
+- Particle type: **Inert**
+- Diameter: 3.62e-10 m; Density: 2375 kg/m³
+- Velocity: Vx = 0.001 m/s, Vy = 0.0
+- Total flow rate: 1e-15 kg/s (symbolic; scale as needed)
+- Body force UDF: **`cl_em_force`**
+
+#### 6. Assign DPM boundary conditions
+
+| Boundary | DPM type | UDF |
+|---|---|---|
+| Inlet | Escape | — (standard) |
+| Outlet | Escape | — (standard) |
+| Bottom wall | Reflect | — (standard) |
+| **Top wall** | **UDF** | **`cl_wall_bc`** |
+
+> The top wall must be one named zone. If it is split, assign `cl_wall_bc`
+> to all top-wall segments; the UDF checks face coordinates internally.
+
+#### 7. Solution settings (continuous phase)
+- Solver: pressure-based, steady
+- Scheme: SIMPLE
+- Momentum: Second-Order Upwind
+- Convergence: residuals < 1 × 10⁻⁶
+
+#### 8. Run strategy
+1. Converge the **continuous phase** first (no DPM, ~500 iterations).
+2. Enable DPM and run with **particle tracking** active.
+3. Check DPM summary: "trapped" count at top wall ≈ expected capture fraction.
+
+---
+
+### Post-processing tips
+- **Contour of UDM-3** (a_y): shows upward acceleration field — highest near top wall at x ≈ X_ELEC.
+- **Particle tracks coloured by Particle Y-velocity**: observe the upward drift.
+- **DPM summary table**: shows injected, escaped, trapped counts per boundary.
+- **Pathline seeding from inlet at y = 0.14 m**: these particles should land on the electrode.
+
+---
+
+## Study 1 — MHD Lorentz Force on Seawater Pipe Flow
+
 # Magnetic Field on Seawater Pipe Flow — Ansys Fluent UDF
 
 ## Problem description
